@@ -7,8 +7,9 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:youtube_player_iframe/youtube_player_iframe.dart';
+import 'package:flutter/services.dart';
 import 'package:youtube_player_iframe/youtube_player_iframe.dart' as yp_iframe;
+import 'package:youtube_player_iframe/youtube_player_iframe.dart';
 
 import '../controller/overlay_controller.dart';
 import '../controller/overlay_controller_scope.dart';
@@ -64,6 +65,14 @@ class YoutubePlayer extends StatefulWidget {
     this.keepAlive = false,
     this.autoFullScreen = true,
     this.enableFullScreenOnVerticalDrag = true,
+    this.enableSeekGesture = true,
+    this.borderRadius,
+    this.canFullscreen = false,
+    this.fullscreenOrientations = const [
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ],
+    this.fullscreenImmersive = true,
   });
 
   /// Controls the player. Create via [YoutubePlayerController.fromVideoId]
@@ -99,6 +108,28 @@ class YoutubePlayer extends StatefulWidget {
 
   /// Enable swiping up/down on the player to toggle fullscreen.
   final bool enableFullScreenOnVerticalDrag;
+
+  /// Enable horizontal drag gestures on the player surface to seek forward/backward.
+  final bool enableSeekGesture;
+
+  final BorderRadius? borderRadius;
+
+  final bool canFullscreen;
+
+  /// Device orientations to lock to when the player enters fullscreen.
+  ///
+  /// Defaults to landscape orientations. When the player exits fullscreen,
+  /// the previously preferred orientations are restored.
+  ///
+  /// Set to an empty list (or all [DeviceOrientation.values]) to avoid
+  /// locking orientation on fullscreen.
+  final List<DeviceOrientation> fullscreenOrientations;
+
+  /// Whether to enable immersive sticky mode (hide status bar and nav bar)
+  /// while the player is in fullscreen.
+  ///
+  /// Default is true. On exit, system UI is restored to edge-to-edge mode.
+  final bool fullscreenImmersive;
 
   @override
   State<YoutubePlayer> createState() => _YoutubePlayerState();
@@ -178,6 +209,7 @@ class _YoutubePlayerState extends State<YoutubePlayer>
         controlsBuilder = (ctx, _) => _DefaultControlsLayer(
           controller: widget.controller,
           overlayController: _overlayCtrl,
+          enableSeekGesture: widget.enableSeekGesture,
         );
       }
       // Non-mobile with builder: controlsBuilder stays null; builder wraps
@@ -194,6 +226,9 @@ class _YoutubePlayerState extends State<YoutubePlayer>
       autoFullScreen: widget.autoFullScreen,
       initParams: initParams,
       controlsBuilder: controlsBuilder,
+      borderRadius: widget.borderRadius,
+      canFullscreen: widget.canFullscreen,
+      fullscreenOrientations: widget.fullscreenOrientations,
     );
 
     // On non-mobile with a custom builder, hand the bare iframe player to
@@ -217,10 +252,12 @@ class _DefaultControlsLayer extends StatefulWidget {
   const _DefaultControlsLayer({
     required this.controller,
     required this.overlayController,
+    required this.enableSeekGesture,
   });
 
   final YoutubePlayerController controller;
   final OverlayController overlayController;
+  final bool enableSeekGesture;
 
   @override
   State<_DefaultControlsLayer> createState() => _DefaultControlsLayerState();
@@ -296,10 +333,18 @@ class _DefaultControlsLayerState extends State<_DefaultControlsLayer> {
       child: GestureDetector(
         behavior: HitTestBehavior.translucent,
         onTap: widget.overlayController.toggle,
-        onHorizontalDragStart: _onHorizontalDragStart,
-        onHorizontalDragUpdate: _onHorizontalDragUpdate,
-        onHorizontalDragEnd: _onHorizontalDragEnd,
-        onHorizontalDragCancel: _onHorizontalDragCancel,
+        onHorizontalDragStart: widget.enableSeekGesture
+            ? _onHorizontalDragStart
+            : null,
+        onHorizontalDragUpdate: widget.enableSeekGesture
+            ? _onHorizontalDragUpdate
+            : null,
+        onHorizontalDragEnd: widget.enableSeekGesture
+            ? _onHorizontalDragEnd
+            : null,
+        onHorizontalDragCancel: widget.enableSeekGesture
+            ? _onHorizontalDragCancel
+            : null,
         child: Stack(
           children: [
             ValueListenableBuilder<bool>(

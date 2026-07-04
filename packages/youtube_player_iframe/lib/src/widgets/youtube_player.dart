@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../controller/youtube_player_controller.dart';
@@ -37,6 +38,12 @@ class YoutubePlayer extends StatefulWidget {
     this.thumbnailFormat = .webp,
     this.initParams,
     this.controlsBuilder,
+    this.borderRadius,
+    this.canFullscreen = false,
+    this.fullscreenOrientations = const [
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ],
   });
 
   /// The controller for this player.
@@ -104,6 +111,25 @@ class YoutubePlayer extends StatefulWidget {
   final Widget Function(BuildContext context, bool isFullscreen)?
   controlsBuilder;
 
+  /// The border radius applied to the player surface.
+  ///
+  /// On mobile the radius is applied to the overlay layers (webview,
+  /// controls and loading overlay) so it works even though the actual
+  /// platform view is rendered in an [OverlayPortal].
+  /// On desktop/web it is applied directly around the player.
+  final BorderRadiusGeometry? borderRadius;
+
+  final bool canFullscreen;
+
+  /// Device orientations to lock to when the player enters fullscreen.
+  ///
+  /// Defaults to landscape orientations. When the player exits fullscreen,
+  /// the previously preferred orientations are restored.
+  ///
+  /// Set to an empty list (or all [DeviceOrientation.values]) to avoid
+  /// locking orientation on fullscreen.
+  final List<DeviceOrientation> fullscreenOrientations;
+
   @override
   State<YoutubePlayer> createState() => _YoutubePlayerState();
 }
@@ -137,6 +163,10 @@ class _YoutubePlayerState extends State<YoutubePlayer>
   Timer? _transitionTimer;
   int _lastPlayingMs = 0;
 
+  /// Saved preferred orientations from before fullscreen was entered so they
+  /// can be restored when fullscreen exits.
+  List<DeviceOrientation>? _previousOrientations;
+
   // Hot restart (debug only): the Dart isolate restarts without calling
   // dispose(), leaving old platform views alive on the native side.  The new
   // run assigns the same IDs (starting from 0), causing a recreating_view
@@ -144,13 +174,16 @@ class _YoutubePlayerState extends State<YoutubePlayer>
   // engine time to finish cleaning up stale views before new ones are created.
   bool _webViewReady = !kDebugMode;
 
+  bool get _useOverlayPortal => isMobile && widget.canFullscreen == true;
+  // bool get _useOverlayPortal => false;
+
   @override
   void initState() {
     super.initState();
     _controller = widget.controller;
     _initPlayer();
 
-    if (isMobile) {
+    if (_useOverlayPortal) {
       _instances.add(this);
       WidgetsBinding.instance.addObserver(this);
       _valueSub = _controller.stream.listen(_onValueChanged);
@@ -163,13 +196,13 @@ class _YoutubePlayerState extends State<YoutubePlayer>
         SchedulerBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
           setState(() => _webViewReady = true);
-          if (isMobile) {
+          if (_useOverlayPortal) {
             _updatePlayerRect();
             _overlayController.show();
           }
         });
       } else {
-        if (isMobile) {
+        if (_useOverlayPortal) {
           _updatePlayerRect();
           _overlayController.show();
         }
@@ -183,28 +216,57 @@ class _YoutubePlayerState extends State<YoutubePlayer>
       _prevFullscreen = isFullscreen;
       if (isFullscreen) {
         _fullscreenCount.value++;
+        _previousOrientations ??= DeviceOrientation.values;
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
+        unawaited(
+          SystemChrome.setPreferredOrientations(
+            widget.fullscreenOrientations.isEmpty
+                ? DeviceOrientation.values
+                : widget.fullscreenOrientations,
+          ),
+        );
       } else {
         _fullscreenCount.value = (_fullscreenCount.value - 1).clamp(
           0,
           _fullscreenCount.value,
         );
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+        unawaited(
+          SystemChrome.setPreferredOrientations(
+            _previousOrientations ?? DeviceOrientation.values,
+          ),
+        );
+
+        _previousOrientations = null;
       }
       _transitionTimer?.cancel();
       _inFullscreenTransition = false;
       // On button press the iframe fires StateChange=paused *before*
       // FullscreenButtonPressed, so _lastPlayerState is already paused by
       // the time we see the fullscreen toggle. The timestamp check catches
-      // that case: if the video was playing within the last 500 ms, the
+      // that case: if the video was playing within the last 1000 ms, the
       // pause was iframe-generated, not user-initiated.
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       final wasPlaying =
           _lastPlayerState == PlayerState.playing ||
           _lastPlayerState == PlayerState.buffering ||
-          (nowMs - _lastPlayingMs) < 500;
+          (nowMs - _lastPlayingMs) < 1000;
       if (wasPlaying) {
         _inFullscreenTransition = true;
-        _transitionTimer = Timer(const Duration(milliseconds: 600), () {
+        _transitionTimer = Timer(const Duration(milliseconds: 1500), () {
           _inFullscreenTransition = false;
+        });
+        // Proactively resume playback after the WebView settles from the
+        // overlay transition. The spurious-pause handler below catches most
+        // cases reactively, but on slow devices the pause may arrive late,
+        // be missed, or the first playVideo() call may be swallowed by the
+        // still-ongoing relayout. These delayed calls are no-ops if the
+        // video is already playing by the time they fire.
+        Timer(const Duration(milliseconds: 300), () {
+          if (mounted && _inFullscreenTransition) _controller.playVideo();
+        });
+        Timer(const Duration(milliseconds: 700), () {
+          if (mounted && _inFullscreenTransition) _controller.playVideo();
         });
       }
     } else if (value.playerState != PlayerState.unknown) {
@@ -256,6 +318,12 @@ class _YoutubePlayerState extends State<YoutubePlayer>
         0,
         _fullscreenCount.value,
       );
+      unawaited(
+        SystemChrome.setPreferredOrientations(
+          _previousOrientations ?? DeviceOrientation.values,
+        ),
+      );
+      _previousOrientations = null;
     }
     super.dispose();
   }
@@ -295,7 +363,7 @@ class _YoutubePlayerState extends State<YoutubePlayer>
   Widget build(BuildContext context) {
     super.build(context);
 
-    if (!isMobile) {
+    if (!_useOverlayPortal) {
       final webView = _webViewReady
           ? WebViewWidget(
               controller: _controller.webViewController,
@@ -305,19 +373,22 @@ class _YoutubePlayerState extends State<YoutubePlayer>
 
       return AspectRatio(
         aspectRatio: widget.aspectRatio,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            webView,
-            if (widget.controlsBuilder != null)
-              widget.controlsBuilder!(context, false),
-            _PlayerLoadingOverlay(
-              controller: _controller,
-              backgroundColor: widget.backgroundColor,
-              thumbnailQuality: widget.thumbnailQuality,
-              thumbnailFormat: widget.thumbnailFormat,
-            ),
-          ],
+        child: ClipRRect(
+          borderRadius: widget.borderRadius ?? BorderRadius.zero,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              webView,
+              if (widget.controlsBuilder != null)
+                widget.controlsBuilder!(context, false),
+              _PlayerLoadingOverlay(
+                controller: _controller,
+                backgroundColor: widget.backgroundColor,
+                thumbnailQuality: widget.thumbnailQuality,
+                thumbnailFormat: widget.thumbnailFormat,
+              ),
+            ],
+          ),
         ),
       );
     }
@@ -348,6 +419,7 @@ class _YoutubePlayerState extends State<YoutubePlayer>
               fullscreenCount: _fullscreenCount,
               thumbnailQuality: widget.thumbnailQuality,
               thumbnailFormat: widget.thumbnailFormat,
+              borderRadius: widget.borderRadius,
             ),
             child: AspectRatio(
               aspectRatio: widget.aspectRatio,
@@ -405,6 +477,7 @@ class _PlayerOverlayContent extends StatelessWidget {
     this.controlsBuilder,
     this.thumbnailQuality = .high,
     this.thumbnailFormat = .webp,
+    this.borderRadius,
   });
 
   final YoutubePlayerController controller;
@@ -419,6 +492,7 @@ class _PlayerOverlayContent extends StatelessWidget {
   final ValueListenable<int> fullscreenCount;
   final ThumbnailQuality thumbnailQuality;
   final ThumbnailFormat thumbnailFormat;
+  final BorderRadiusGeometry? borderRadius;
 
   @override
   Widget build(BuildContext context) {
@@ -502,7 +576,10 @@ class _PlayerOverlayContent extends StatelessWidget {
               child: SizedBox(
                 width: playerRect.width,
                 height: playerRect.height,
-                child: child,
+                child: ClipRRect(
+                  borderRadius: borderRadius ?? BorderRadius.zero,
+                  child: child,
+                ),
               ),
             ),
           );
